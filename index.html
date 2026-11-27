@@ -35,6 +35,16 @@
   #start.show { display:flex; }
   #start p { color:var(--sub); font-size:14px; line-height:1.6; }
   #start button { font-size:20px; padding:16px 36px; }
+  #set { position:fixed; inset:0; background:#0f1115; display:none; flex-direction:column; gap:12px;
+    padding:20px; z-index:10; overflow-y:auto; }
+  #set.show { display:flex; }
+  #set label { font-size:13px; color:var(--sub); display:block; margin-bottom:4px; }
+  #set input, #set select { width:100%; background:var(--card); color:var(--fg); border:1px solid #2a2f3a;
+    border-radius:10px; padding:12px; font-size:15px; }
+  #set .note { font-size:12px; color:var(--sub); line-height:1.6; }
+  #set .row { display:flex; gap:8px; }
+  #set .row button { flex:1; }
+  #setmsg { font-size:13px; min-height:18px; }
   #err { color:#ff8a8a !important; font-weight:600; font-size:15px !important; }
 </style>
 </head>
@@ -44,6 +54,7 @@
   <span id="status">준비 중…</span>
   <button id="mode" class="acc"></button>
   <button id="clear">지우기</button>
+  <button id="gear" title="AI 번역 설정">⚙️</button>
 </header>
 <div id="log"><div id="empty">🎧 말씀하시면 여기에<br>번역이 표시됩니다</div></div>
 
@@ -52,6 +63,26 @@
   <p>처음 한 번만 마이크 권한을 <b>허용</b>해 주세요.<br>이후엔 앱을 열면 자동으로 듣기 시작합니다.</p>
   <button id="startBtn" class="acc">시작</button>
   <p id="err"></p>
+</div>
+
+<div id="set">
+  <h2>⚙️ AI 번역 설정</h2>
+  <p class="note">기본 번역(구글 기계번역)보다 훨씬 자연스러운 번역을 원하면 AI 키를 넣으세요.<br>
+  키는 <b>이 폰의 브라우저에만</b> 저장되고, 번역할 때만 해당 회사 서버로 전송됩니다.</p>
+  <div><label>번역 엔진</label>
+    <select id="prov">
+      <option value="google">기본 (구글 기계번역, 무료)</option>
+      <option value="claude">Claude (Anthropic)</option>
+      <option value="openai">OpenAI (ChatGPT)</option>
+      <option value="gemini">Gemini (Google AI)</option>
+    </select></div>
+  <div id="keybox"><label>API 키</label><input id="key" type="password" placeholder="sk-..." autocomplete="off"></div>
+  <div id="modelbox"><label>모델 이름 (바뀔 수 있어요)</label><input id="model" type="text" autocomplete="off"></div>
+  <p id="setmsg"></p>
+  <div class="row"><button id="test">연결 테스트</button><button id="save" class="acc">저장</button></div>
+  <button id="setclose">닫기</button>
+  <p class="note">· 키는 GitHub 같은 곳에 올리지 말고, 여기에만 입력하세요.<br>
+  · 문장이 끝날 때마다 AI를 한 번 호출합니다. 요금이 걱정되면 해당 사이트에서 월 사용 한도를 설정해 두세요.</p>
 </div>
 
 <script>
@@ -99,6 +130,88 @@ async function translate(text, from, to){
   } catch(e){ return '(번역 실패 - 인터넷 연결을 확인하세요)'; }
 }
 
+
+// ===== AI 번역 설정 =====
+const DEFAULT_MODEL = { claude:'claude-haiku-5-5', openai:'gpt-4o-mini', gemini:'gemini-2.5-flash' };
+let cfg = { prov:'google', key:'', model:'' };
+try { cfg = Object.assign(cfg, JSON.parse(localStorage.getItem('cfg') || '{}')); } catch(e){}
+const hist = [];   // 최근 대화(문맥용)
+
+function fillSettings(){
+  $('prov').value = cfg.prov; $('key').value = cfg.key; $('model').value = cfg.model || DEFAULT_MODEL[cfg.prov] || '';
+  const g = $('prov').value === 'google';
+  $('keybox').style.display = g ? 'none' : 'block'; $('modelbox').style.display = g ? 'none' : 'block';
+}
+$('prov').onchange = () => { $('model').value = DEFAULT_MODEL[$('prov').value] || ''; cfg.prov = $('prov').value; 
+  const g = $('prov').value === 'google'; $('keybox').style.display = g ? 'none':'block'; $('modelbox').style.display = g ? 'none':'block'; };
+$('gear').onclick = () => { fillSettings(); $('setmsg').textContent = ''; $('set').classList.add('show'); };
+$('setclose').onclick = () => $('set').classList.remove('show');
+$('save').onclick = () => {
+  cfg = { prov:$('prov').value, key:$('key').value.trim(), model:$('model').value.trim() };
+  try { localStorage.setItem('cfg', JSON.stringify(cfg)); } catch(e){}
+  $('setmsg').style.color = '#7bd88f'; $('setmsg').textContent = '저장됨 ✓';
+  setTimeout(() => $('set').classList.remove('show'), 600);
+};
+$('test').onclick = async () => {
+  cfg = { prov:$('prov').value, key:$('key').value.trim(), model:$('model').value.trim() };
+  $('setmsg').style.color = '#8b93a3'; $('setmsg').textContent = '테스트 중…';
+  try {
+    const t = await llmTranslate('The meeting has been moved to three o\'clock.', 'en', 'ko', []);
+    $('setmsg').style.color = '#7bd88f'; $('setmsg').textContent = '성공: ' + t;
+  } catch(e){ $('setmsg').style.color = '#ff8a8a'; $('setmsg').textContent = '실패: ' + e.message; }
+};
+
+const NAME = { en:'English', ko:'Korean' };
+async function llmTranslate(text, from, to, ctx){
+  const sys = 'You are a professional live interpreter. Translate the speaker\'s words from ' + NAME[from] + ' to ' + NAME[to] +
+    '. The text comes from automatic speech recognition, so it may contain recognition errors, missing punctuation, or sentence fragments. ' +
+    'Use the previous sentences as context to infer what the speaker really meant, and translate naturally the way a fluent native speaker would say it. ' +
+    'Output ONLY the translation, with no notes, explanations or quotation marks.';
+  const user = (ctx.length ? 'Previous sentences (context only, do NOT translate):\n' + ctx.map(c => '- ' + c).join('\n') + '\n\n' : '') +
+    'Translate this:\n' + text;
+  const model = cfg.model || DEFAULT_MODEL[cfg.prov];
+  const ac = new AbortController(); const to_ = setTimeout(() => ac.abort(), 15000);
+  try {
+    let r, j;
+    if (cfg.prov === 'claude'){
+      r = await fetch('https://api.anthropic.com/v1/messages', { method:'POST', signal:ac.signal, headers:{
+        'content-type':'application/json','x-api-key':cfg.key,'anthropic-version':'2023-06-01',
+        'anthropic-dangerous-direct-browser-access':'true' },
+        body: JSON.stringify({ model, max_tokens:400, system:sys, messages:[{ role:'user', content:user }] }) });
+      j = await r.json(); if (!r.ok) throw new Error((j.error && j.error.message) || r.status);
+      return j.content.map(c => c.text || '').join('').trim();
+    }
+    if (cfg.prov === 'openai'){
+      r = await fetch('https://api.openai.com/v1/chat/completions', { method:'POST', signal:ac.signal, headers:{
+        'content-type':'application/json','authorization':'Bearer ' + cfg.key },
+        body: JSON.stringify({ model, messages:[{ role:'system', content:sys },{ role:'user', content:user }] }) });
+      j = await r.json(); if (!r.ok) throw new Error((j.error && j.error.message) || r.status);
+      return j.choices[0].message.content.trim();
+    }
+    if (cfg.prov === 'gemini'){
+      r = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
+        method:'POST', signal:ac.signal, headers:{ 'content-type':'application/json','x-goog-api-key':cfg.key },
+        body: JSON.stringify({ systemInstruction:{ parts:[{ text:sys }] }, contents:[{ role:'user', parts:[{ text:user }] }] }) });
+      j = await r.json(); if (!r.ok) throw new Error((j.error && j.error.message) || r.status);
+      return j.candidates[0].content.parts.map(p => p.text || '').join('').trim();
+    }
+    throw new Error('엔진 미선택');
+  } finally { clearTimeout(to_); }
+}
+
+// 확정 문장 번역: AI 설정이 있으면 AI, 실패하면 구글 번역으로 대체
+async function translateFinal(text, from, to){
+  if (cfg.prov !== 'google' && cfg.key){
+    try {
+      const t = await llmTranslate(text, from, to, hist.slice(-3));
+      hist.push(text); if (hist.length > 6) hist.shift();
+      return t;
+    } catch(e){ setStatus('AI 번역 오류(' + String(e.message).slice(0,40) + ') → 기본 번역 사용', true); }
+  }
+  hist.push(text); if (hist.length > 6) hist.shift();
+  return translate(text, from, to);
+}
+
 function targetOf(lang){ return lang === 'en' ? 'ko' : 'en'; }
 
 function listen(){
@@ -133,7 +246,7 @@ function listen(){
         const dst = el.querySelector('.dst');
         if (!dst.textContent) dst.textContent = '…';
         const my = ++seq;
-        translate(text, L[lang].code, L[targetOf(lang)].code).then(t => {
+        translateFinal(text, L[lang].code, L[targetOf(lang)].code).then(t => {
           dst.textContent = t; logEl.scrollTop = logEl.scrollHeight;
         });
       } else {

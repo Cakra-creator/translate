@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1115">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>실시간 통역 자막</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --fg:#f2f4f8; --sub:#8b93a3; --acc:#4da3ff; --rec:#ff5c5c; }
+  * { box-sizing:border-box; margin:0; -webkit-tap-highlight-color:transparent; }
+  html,body { height:100%; background:var(--bg); color:var(--fg);
+    font-family:-apple-system,"Noto Sans KR","Apple SD Gothic Neo",sans-serif; }
+  body { display:flex; flex-direction:column; padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+  header { display:flex; align-items:center; gap:8px; padding:10px 12px; }
+  .dot { width:10px; height:10px; border-radius:50%; background:var(--sub); flex:none; }
+  .dot.on { background:var(--rec); animation:p 1.2s infinite; }
+  @keyframes p { 50% { opacity:.3; } }
+  #status { flex:1; font-size:12px; color:var(--sub); line-height:1.3; }
+  button { font:inherit; color:var(--fg); background:var(--card); border:1px solid #2a2f3a;
+    border-radius:12px; padding:9px 12px; font-size:13px; }
+  button.acc { background:var(--acc); border-color:var(--acc); color:#06121f; font-weight:700; }
+  #log { flex:1; overflow-y:auto; padding:6px 12px 14px; display:flex; flex-direction:column; gap:10px; }
+  .item { background:var(--card); border-radius:14px; padding:12px 14px; }
+  .src { font-size:14px; color:var(--sub); line-height:1.4; }
+  .dst { font-size:22px; font-weight:600; line-height:1.4; margin-top:4px; word-break:keep-all; }
+  .item.live { outline:1px solid #2f6db3; }
+  .item.live .src { color:var(--fg); }
+  #empty { color:var(--sub); text-align:center; margin:auto; font-size:15px; line-height:1.7; }
+  #start { position:fixed; inset:0; background:#0f1115; display:none; flex-direction:column;
+    align-items:center; justify-content:center; gap:16px; text-align:center; padding:30px; z-index:9; }
+  #start.show { display:flex; }
+  #start p { color:var(--sub); font-size:14px; line-height:1.6; }
+  #start button { font-size:20px; padding:16px 36px; }
+  #err { color:#ff8a8a !important; font-weight:600; font-size:15px !important; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <span id="status">준비 중…</span>
+  <button id="mode" class="acc"></button>
+  <button id="clear">지우기</button>
+</header>
+<div id="log"><div id="empty">🎧 말씀하시면 여기에<br>번역이 표시됩니다</div></div>
+
+<div id="start">
+  <h2>🎧 실시간 통역 자막</h2>
+  <p>처음 한 번만 마이크 권한을 <b>허용</b>해 주세요.<br>이후엔 앱을 열면 자동으로 듣기 시작합니다.</p>
+  <button id="startBtn" class="acc">시작</button>
+  <p id="err"></p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const logEl = $('log'), statusEl = $('status'), dot = $('dot');
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+const L = {
+  en: { rec:'en-US', code:'en', name:'영어' },
+  ko: { rec:'ko-KR', code:'ko', name:'한국어' }
+};
+const MODES = ['en','ko','auto'];
+const LABEL = { en:'🇺🇸 영어→한글', ko:'🇰🇷 한글→영어', auto:'🔄 자동 전환' };
+
+let mode = 'en';
+try { const m = localStorage.getItem('mode'); if (MODES.includes(m)) mode = m; } catch(e){}
+$('mode').textContent = LABEL[mode];
+
+let rec = null, running = false, cur = 'en';   // cur: 지금 듣는 언어
+let liveEl = null, lastFinal = '', gotResult = false, seq = 0, tTimer = null, wake = null;
+
+function setStatus(t, on){ statusEl.textContent = t; dot.classList.toggle('on', !!on); }
+function showStart(msg){ $('err').textContent = msg || ''; $('start').classList.add('show'); }
+
+function addItem(live){
+  const e = $('empty'); if (e) e.remove();
+  const d = document.createElement('div');
+  d.className = 'item' + (live ? ' live' : '');
+  d.innerHTML = '<div class="src"></div><div class="dst"></div>';
+  logEl.appendChild(d);
+  logEl.scrollTop = logEl.scrollHeight;
+  return d;
+}
+
+async function translate(text, from, to){
+  try {
+    const u = 'https://translate.googleapis.com/translate_a/single?client=gtx&sl='+from+'&tl='+to+'&dt=t&q='+encodeURIComponent(text);
+    const r = await fetch(u); const j = await r.json();
+    return j[0].map(x => x[0]).join('');
+  } catch(e){}
+  try {
+    const r = await fetch('https://api.mymemory.translated.net/get?q='+encodeURIComponent(text)+'&langpair='+from+'|'+to);
+    const j = await r.json();
+    return j.responseData.translatedText;
+  } catch(e){ return '(번역 실패 - 인터넷 연결을 확인하세요)'; }
+}
+
+function targetOf(lang){ return lang === 'en' ? 'ko' : 'en'; }
+
+function listen(){
+  if (!running) return;
+  if (mode !== 'auto') cur = mode;
+  gotResult = false; lastFinal = '';
+  const r = new SR();
+  rec = r;
+  r.lang = L[cur].rec;
+  r.continuous = true;
+  r.interimResults = true;
+  const lang = cur;
+
+  r.onstart = () => setStatus('듣는 중… (' + L[lang].name + (mode==='auto' ? ', 자동' : '') + ')', true);
+
+  r.onresult = e => {
+    gotResult = true;
+    for (let i = e.resultIndex; i < e.results.length; i++){
+      const res = e.results[i];
+      let text = res[0].transcript.trim();
+      if (!text) continue;
+      if (res.isFinal){
+        // 안드로이드 중복 방지
+        const full = text;
+        if (lastFinal && text.startsWith(lastFinal)) text = text.slice(lastFinal.length).trim();
+        lastFinal = full;
+        if (!text) continue;
+        const el = liveEl || addItem(false);
+        liveEl = null;
+        el.classList.remove('live');
+        el.querySelector('.src').textContent = text;
+        const dst = el.querySelector('.dst');
+        if (!dst.textContent) dst.textContent = '…';
+        const my = ++seq;
+        translate(text, L[lang].code, L[targetOf(lang)].code).then(t => {
+          dst.textContent = t; logEl.scrollTop = logEl.scrollHeight;
+        });
+      } else {
+        // 말하는 중: 원문 즉시 표시 + 번역은 잠깐 멈추면 갱신
+        if (!liveEl) liveEl = addItem(true);
+        const el = liveEl;
+        let shown = text;
+        if (lastFinal && shown.startsWith(lastFinal)) shown = shown.slice(lastFinal.length).trim();
+        if (!shown) continue;
+        el.querySelector('.src').textContent = shown;
+        clearTimeout(tTimer);
+        const my = ++seq;
+        tTimer = setTimeout(() => {
+          translate(shown, L[lang].code, L[targetOf(lang)].code).then(t => {
+            if (my === seq && el.classList.contains('live')) el.querySelector('.dst').textContent = t;
+          });
+        }, 600);
+      }
+    }
+    logEl.scrollTop = logEl.scrollHeight;
+  };
+
+  r.onerror = e => {
+    if (e.error === 'no-speech' || e.error === 'aborted') return;
+    const msg = {
+      'not-allowed':'마이크 권한이 차단되었습니다.\n주소창 왼쪽 아이콘 → 권한 → 마이크 → 허용',
+      'service-not-allowed':'이 브라우저/주소에서는 음성인식을 쓸 수 없습니다.\nChrome에서 https:// 주소로 여세요.',
+      'network':'음성인식 서버에 연결하지 못했습니다. 인터넷을 확인하세요.',
+      'audio-capture':'마이크를 사용할 수 없습니다. 다른 앱이 마이크를 쓰는 중인지 확인하세요.',
+      'language-not-supported':'지원하지 않는 언어입니다.'
+    };
+    setStatus('오류: ' + e.error, false);
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed'){
+      running = false; showStart(msg[e.error]);
+    } else if (msg[e.error]) setStatus(msg[e.error].split('\n')[0], false);
+  };
+
+  r.onend = () => {
+    dot.classList.remove('on');
+    if (rec !== r) return;
+    if (!running) return;
+    if (mode === 'auto' && !gotResult) cur = (cur === 'en' ? 'ko' : 'en');   // 조용하면 언어 교대
+    setTimeout(listen, 250);
+  };
+
+  try { r.start(); } catch(e){ setTimeout(listen, 500); }
+}
+
+function stopAll(){
+  running = false;
+  if (rec){ const r = rec; rec = null; r.onend = r.onresult = r.onerror = null; try{ r.abort(); }catch(e){} }
+  liveEl = null;
+}
+
+async function keepAwake(){ try { if ('wakeLock' in navigator) wake = await navigator.wakeLock.request('screen'); } catch(e){} }
+
+// 사용자가 시작 버튼을 누르면 곧바로(대기 없이) 시작 → 권한 팝업이 바로 뜸
+function userStart(){
+  if (!SR){ showStart('이 브라우저는 음성인식을 지원하지 않습니다.\n안드로이드 Chrome으로 여세요.'); return; }
+  if (!window.isSecureContext){ showStart('⚠️ https:// 주소로 열어야 마이크가 작동합니다.\n(현재: ' + location.protocol + ')'); return; }
+  stopAll();
+  running = true;
+  $('start').classList.remove('show');
+  listen();
+  keepAwake();
+}
+
+$('startBtn').onclick = userStart;
+$('mode').onclick = () => {
+  mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
+  try { localStorage.setItem('mode', mode); } catch(e){}
+  $('mode').textContent = LABEL[mode];
+  stopAll(); running = true; listen();
+};
+$('clear').onclick = () => { logEl.innerHTML = '<div id="empty">🎧 말씀하시면 여기에<br>번역이 표시됩니다</div>'; liveEl = null; };
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  keepAwake();
+  if (!running && !$('start').classList.contains('show')) userStart();
+});
+
+// 앱을 열면: 권한이 이미 허용되어 있으면 자동 시작, 아니면 시작 버튼 표시
+(async () => {
+  if (!SR){ showStart('이 브라우저는 음성인식을 지원하지 않습니다.\n안드로이드 Chrome으로 여세요.'); return; }
+  if (!window.isSecureContext){ showStart('⚠️ https:// 주소로 열어야 마이크가 작동합니다.\n(현재: ' + location.protocol + ')'); return; }
+  let granted = false;
+  try {
+    if (navigator.permissions){
+      const p = await navigator.permissions.query({ name:'microphone' });
+      granted = p.state === 'granted';
+    }
+  } catch(e){}
+  if (granted) userStart(); else showStart('');
+})();
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(()=>{});
+</script>
+</body>
+</html>
